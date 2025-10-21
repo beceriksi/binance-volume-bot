@@ -1,4 +1,4 @@
-name: Binance USDT Strategy Scanner
+name: MEXC 1H Strategy Scanner
 
 on:
   schedule:
@@ -25,13 +25,27 @@ jobs:
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           CHAT_ID:        ${{ secrets.CHAT_ID }}
-          EXCHANGE: "binance"
-          EMA_FAST: "50"
-          EMA_SLOW: "200"
-          VOLUME_MULTIPLIER: "1.3"
-          RSI_LOW: "40"
-          RSI_HIGH: "70"
+          EXCHANGE: "mexc"
+          TIMEFRAME: "1h"
           LIMIT: "300"
-          SCAN_PAUSE: "3"
+          EMA_FAST: "10"
+          EMA_MID: "20"
+          EMA_SLOW: "30"
+          RSI_WINDOW: "14"
+          RSI_MIN: "50"
+          PRICE_MAX_CHANGE: "0.05"
+          PRICE_MIN_CHANGE: "-0.02"
+          CROSS_LOOKBACK: "2"
+          STOP_LOSS_PCT: "0.03"
+          SCAN_PAUSE: "0.15"
+          CSV_OUT: "mexc_1h_strategy_hits.csv"
         run: |
           python main.py
+
+      - name: Upload CSV artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mexc-1h-hits
+          path: mexc_1h_strategy_hits.csv
+          if-no-files-found: ignore
