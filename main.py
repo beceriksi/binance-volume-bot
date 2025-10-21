@@ -1,212 +1,214 @@
 # main.py
-# Binance USDT scanner -> EMA50/EMA200 (15m + 1h), RSI, volume spike, buy-wall -> Telegram alerts
+# MEXC / USDT / 1H — EMA10/20/30 cross + RSI yükselişi + price cap -> Telegram alerts
+# NOT: Bu kod sadece SİNYAL üretir. LIVE TRADE YAPMAZ.
+
 import os, time, math, logging
 from datetime import datetime
-
 import ccxt
-import numpy as np
 import pandas as pd
+import numpy as np
 import requests
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-logger = logging.getLogger("binance-usdt-scanner")
+logger = logging.getLogger("mexc-1h-strategy")
 
-# --- CONFIG (env üzerinden değiştirilebilir) ---
+# ---------- CONFIG (env üzerinden değiştirebilirsiniz) ----------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")  # GitHub Secret
-CHAT_ID        = os.getenv("CHAT_ID")         # GitHub Secret (string)
+CHAT_ID        = os.getenv("CHAT_ID")         # GitHub Secret
 
-EXCHANGE_NAME  = os.getenv("EXCHANGE", "binance")
-QUOTE          = "USDT"
-TIMEFRAME_1H   = os.getenv("TIMEFRAME_1H", "1h")
-TIMEFRAME_15M  = os.getenv("TIMEFRAME_15M", "15m")
-LIMIT          = int(os.getenv("LIMIT", "300"))
+EXCHANGE_NAME = os.getenv("EXCHANGE", "mexc")
+QUOTE = "USDT"
+TIMEFRAME = os.getenv("TIMEFRAME", "1h")
+LIMIT = int(os.getenv("LIMIT", "300"))
 
 # Strategy params
-EMA_FAST = int(os.getenv("EMA_FAST", "50"))
-EMA_SLOW = int(os.getenv("EMA_SLOW", "200"))
-VOLUME_MULTIPLIER = float(os.getenv("VOLUME_MULTIPLIER", "1.3"))  # 15m volume spike multiplier
-RSI_LOW  = float(os.getenv("RSI_LOW", "40"))
-RSI_HIGH = float(os.getenv("RSI_HIGH", "70"))
+EMA_FAST = int(os.getenv("EMA_FAST", "10"))
+EMA_MID  = int(os.getenv("EMA_MID", "20"))
+EMA_SLOW = int(os.getenv("EMA_SLOW", "30"))
 
-SCAN_PAUSE = int(os.getenv("SCAN_PAUSE", "5"))  # seconds between symbols (politeness)
+RSI_WINDOW = int(os.getenv("RSI_WINDOW", "14"))
+RSI_MIN = float(os.getenv("RSI_MIN", "50.0"))       # RSI must be > this
+PRICE_MAX_CHANGE = float(os.getenv("PRICE_MAX_CHANGE", "0.05"))  # <= 5%
+PRICE_MIN_CHANGE = float(os.getenv("PRICE_MIN_CHANGE", "-0.02")) # >= -2%
 
-# --- util ---
-def send_telegram(text):
+CROSS_LOOKBACK = int(os.getenv("CROSS_LOOKBACK", "2"))  # last N bars where cross may have occurred
+STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "0.03"))  # suggested stop-loss (3%)
+
+SCAN_PAUSE = float(os.getenv("SCAN_PAUSE", "0.15"))  # seconds between symbol requests
+CSV_OUT = os.getenv("CSV_OUT", "mexc_1h_strategy_hits.csv")
+
+# ---------- HELPERS ----------
+def send_telegram(text: str):
     if not TELEGRAM_TOKEN or not CHAT_ID:
-        logger.info("Telegram not configured — skipping send")
+        logger.info("Telegram credentials not set - skipping send.")
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"}
     try:
         r = requests.post(url, json=payload, timeout=15)
         r.raise_for_status()
-        logger.info("Telegram message sent (%d chars)", len(text))
+        logger.info("Telegram message sent.")
     except Exception as e:
-        logger.exception("Failed to send telegram: %s", e)
+        logger.exception("Failed to send Telegram message: %s", e)
 
-# indicators
-def ema(arr, window):
-    arr = np.asarray(arr, dtype=float)
-    alpha = 2.0 / (window + 1.0)
-    out = np.zeros_like(arr)
-    out[0] = arr[0]
-    for i in range(1, len(arr)):
-        out[i] = alpha * arr[i] + (1 - alpha) * out[i-1]
-    return out
+def ema(series: pd.Series, window: int) -> pd.Series:
+    return series.ewm(span=window, adjust=False).mean()
 
-def rsi(series, window=14):
-    series = np.asarray(series, dtype=float)
-    deltas = np.diff(series)
-    if len(deltas) < window:
-        return np.array([50.0]*len(series))
-    up = np.where(deltas>0, deltas, 0.0)
-    down = np.where(deltas<0, -deltas, 0.0)
-    up_ema = pd.Series(up).ewm(alpha=1/window, adjust=False).mean().to_numpy()
-    down_ema = pd.Series(down).ewm(alpha=1/window, adjust=False).mean().to_numpy()
-    rs = up_ema / (down_ema + 1e-9)
-    rsi = 100.0 - (100.0 / (1.0 + rs))
-    # pad to match series length
-    rsi_full = np.concatenate(([rsi[0]] , rsi)) if len(rsi)>0 else np.array([50.0]*len(series))
-    # ensure len match
-    if len(rsi_full) < len(series):
-        rsi_full = np.pad(rsi_full, (len(series)-len(rsi_full),0), 'edge')
-    return rsi_full
+def compute_rsi(close: pd.Series, window: int = 14) -> pd.Series:
+    delta = close.diff()
+    up = delta.clip(lower=0)
+    down = -1 * delta.clip(upper=0)
+    ma_up = up.ewm(alpha=1/window, adjust=False).mean()
+    ma_down = down.ewm(alpha=1/window, adjust=False).mean()
+    rs = ma_up / (ma_down + 1e-9)
+    rsi = 100 - (100 / (1 + rs))
+    return rsi.fillna(50)
 
-def has_buy_wall(order_book, multiplier=2.0):
-    bids = order_book.get("bids", [])
-    asks = order_book.get("asks", [])
-    if not bids or not asks:
+def recent_crossed_up(fast: pd.Series, slow: pd.Series, lookback: int = 2) -> bool:
+    # Check if fast crossed above slow within last `lookback` bars
+    n = len(fast)
+    if n < lookback + 1:
         return False
-    top_bid_vol = bids[0][1]
-    top_asks = [a[1] for a in asks[:5]] if len(asks)>=1 else [1e-9]
-    avg_asks = sum(top_asks)/max(len(top_asks),1)
-    return top_bid_vol >= avg_asks * multiplier
+    for i in range(1, lookback+1):
+        # compare bar -i and bar -(i+1)
+        cur = n - i
+        prev = n - i - 1
+        if prev < 0:
+            continue
+        if (fast.iloc[prev] <= slow.iloc[prev]) and (fast.iloc[cur] > slow.iloc[cur]):
+            return True
+    return False
 
-# --- exchange setup ---
-def make_exchange(name="binance"):
+# ---------- EXCHANGE ----------
+def make_exchange(name="mexc"):
     ex = getattr(ccxt, name)({
         "enableRateLimit": True,
-        "options": {"defaultType": "spot"},
+        "options": {"defaultType": "spot"}
     })
+    # load markets may raise if API blocked - let it bubble up
     ex.load_markets()
     return ex
 
-def fetch_ohlcv_safe(ex, symbol, timeframe, limit=200):
+def fetch_ohlcv_safe(ex, symbol, timeframe, limit=300):
     try:
-        data = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-        return np.array(data) if data else None
+        raw = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+        if not raw:
+            return None
+        df = pd.DataFrame(raw, columns=["ts","open","high","low","close","volume"])
+        df["time"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
+        df.set_index("time", inplace=True)
+        for c in ["open","high","low","close","volume"]:
+            df[c] = df[c].astype(float)
+        return df
     except Exception as e:
-        logger.warning("fetch_ohlcv failed %s %s -> %s", symbol, timeframe, str(e))
+        logger.warning("fetch_ohlcv failed for %s %s: %s", symbol, timeframe, str(e))
         return None
 
-# --- evaluation per symbol ---
+# ---------- EVALUATE SYMBOL ----------
 def evaluate_symbol(ex, symbol):
-    # returns dict with match bool and details
-    res = {"symbol": symbol, "match": False, "reasons": [], "details": {}}
+    df = fetch_ohlcv_safe(ex, symbol, TIMEFRAME, limit=LIMIT)
+    if df is None or len(df) < max(EMA_SLOW, RSI_WINDOW) + 5:
+        return None
 
-    kl15 = fetch_ohlcv_safe(ex, symbol, TIMEFRAME_15M, limit=200)
-    kl1h = fetch_ohlcv_safe(ex, symbol, TIMEFRAME_1H, limit=200)
-    if kl15 is None or kl1h is None:
-        res["reasons"].append("ohlcv fetch failed")
-        return res
+    close = df["close"]
+    # indicators
+    e_fast = ema(close, EMA_FAST)
+    e_mid  = ema(close, EMA_MID)
+    e_slow = ema(close, EMA_SLOW)
+    rsi = compute_rsi(close, RSI_WINDOW)
 
-    close15 = kl15[:,4].astype(float)
-    vol15   = kl15[:,5].astype(float)
-    close1h = kl1h[:,4].astype(float)
+    # latest indexes
+    if len(close) < 3:
+        return None
+    last = -1
+    prev = -2
 
-    # EMA checks
-    if len(close15) < max(EMA_SLOW, EMA_FAST) or len(close1h) < max(EMA_SLOW, EMA_FAST):
-        res["reasons"].append("not enough history")
-        return res
+    # Conditions:
+    # 1) latest EMA order: fast > mid > slow
+    cond_order = (e_fast.iloc[last] > e_mid.iloc[last]) and (e_mid.iloc[last] > e_slow.iloc[last])
+    # 2) recent up-cross of fast over mid and fast over slow within CROSS_LOOKBACK bars
+    cross_mid = recent_crossed_up(e_fast, e_mid, lookback=CROSS_LOOKBACK)
+    cross_slow = recent_crossed_up(e_fast, e_slow, lookback=CROSS_LOOKBACK)
+    cross_ok = cross_mid and cross_slow
+    # 3) RSI > RSI_MIN and RSI increased vs previous bar
+    rsi_ok = (rsi.iloc[last] > RSI_MIN) and (rsi.iloc[last] > rsi.iloc[prev])
+    # 4) price change constraint
+    change = (close.iloc[last] - close.iloc[prev]) / max(close.iloc[prev], 1e-12)
+    price_ok = (change <= PRICE_MAX_CHANGE) and (change >= PRICE_MIN_CHANGE)
 
-    ema50_15 = ema(close15, EMA_FAST)[-1]
-    ema200_15 = ema(close15, EMA_SLOW)[-1]
-    ema50_1h = ema(close1h, EMA_FAST)[-1]
-    ema200_1h = ema(close1h, EMA_SLOW)[-1]
-
-    cond_15 = ema50_15 > ema200_15
-    cond_1h = ema50_1h > ema200_1h
-    if not cond_15:
-        res["reasons"].append("15m EMA fail")
-    if not cond_1h:
-        res["reasons"].append("1h EMA fail")
-
-    # volume spike on 15m
-    avg_vol = np.mean(vol15[-20:]) if len(vol15)>=20 else np.mean(vol15)
-    curr_vol = float(vol15[-1])
-    vol_ok = curr_vol >= avg_vol * VOLUME_MULTIPLIER
-    if not vol_ok:
-        res["reasons"].append("vol not spike")
-
-    # RSI 15m
-    rsi_vals = rsi(close15)
-    rsi_latest = float(rsi_vals[-1])
-    rsi_ok = (RSI_LOW <= rsi_latest <= RSI_HIGH)
+    reasons = []
+    if not cond_order:
+        reasons.append("EMA order fail")
+    if not cross_ok:
+        reasons.append("No recent EMA up-cross")
     if not rsi_ok:
-        res["reasons"].append(f"rsi {rsi_latest:.1f} out of {RSI_LOW}-{RSI_HIGH}")
+        reasons.append("RSI condition fail")
+    if not price_ok:
+        reasons.append(f"price change {change:.3f} out of range")
 
-    # orderbook buy wall
-    try:
-        ob = ex.fetch_order_book(symbol, limit=10)
-        wall = has_buy_wall(ob, multiplier=2.0)
-        if not wall:
-            res["reasons"].append("no buy wall")
-    except Exception as e:
-        res["reasons"].append("orderbook fail")
-        wall = False
-
-    match = cond_15 and cond_1h and vol_ok and rsi_ok and wall
-    res["match"] = bool(match)
-    res["details"] = {
-        "ema50_15": float(ema50_15),
-        "ema200_15": float(ema200_15),
-        "ema50_1h": float(ema50_1h),
-        "ema200_1h": float(ema200_1h),
-        "avg_vol_15_20": float(avg_vol),
-        "curr_vol_15": float(curr_vol),
-        "rsi_15": float(rsi_latest),
-        "buy_wall": bool(wall),
-        "last_close_15": float(close15[-1]),
-        "time_utc": datetime.utcnow().isoformat() + "Z"
+    match = cond_order and cross_ok and rsi_ok and price_ok
+    details = {
+        "symbol": symbol,
+        "close": float(close.iloc[last]),
+        "change": float(change),
+        "ema_fast": float(e_fast.iloc[last]),
+        "ema_mid": float(e_mid.iloc[last]),
+        "ema_slow": float(e_slow.iloc[last]),
+        "rsi": float(rsi.iloc[last]),
+        "rsi_prev": float(rsi.iloc[prev]),
+        "time_utc": df.index[last].to_pydatetime().isoformat() + "Z"
     }
-    if match:
-        res["reasons"] = ["all green"]
-    return res
+    return {"match": bool(match), "reasons": reasons, "details": details}
 
-# --- main runner (single scan) ---
+# ---------- MAIN RUN ----------
 def run_once():
     ex = make_exchange(EXCHANGE_NAME)
-    # collect USDT markets
-    markets = [s for s,m in ex.markets.items() if m.get("active") and m.get("spot") and m.get("quote")==QUOTE]
+    # build list of USDT spot markets
+    markets = [s for s,m in ex.markets.items() if m.get("active") and m.get("spot") and m.get("quote") == QUOTE]
     markets = sorted(markets)
-    logger.info("Found %d %s markets (scanning top %d)", len(markets), QUOTE, len(markets))
+    logger.info("Scanning %d %s markets", len(markets), QUOTE)
+
     hits = []
     for i, sym in enumerate(markets, 1):
         try:
-            logger.info("Evaluating %s (%d/%d)", sym, i, len(markets))
-            r = evaluate_symbol(ex, sym)
-            if r["match"]:
-                hits.append(r)
-                logger.info("MATCH %s", sym)
+            logger.debug("Checking %s (%d/%d)", sym, i, len(markets))
+            res = evaluate_symbol(ex, sym)
+            if res and res["match"]:
+                hits.append(res["details"])
+                logger.info("MATCH %s | RSI %.2f | change %.2f%%", sym, res["details"]["rsi"], res["details"]["change"]*100)
             time.sleep(SCAN_PAUSE)
         except Exception as e:
-            logger.exception("Error evaluating %s: %s", sym, str(e))
+            logger.exception("Error for %s: %s", sym, str(e))
+            continue
+
     # prepare message
     if hits:
-        lines = ["🔥 *Binance USDT — Strategy Matches* 🔥", ""]
-        for h in hits:
-            d = h["details"]
-            lines.append(f"*{h['symbol']}* | Close={d['last_close_15']:.6f}")
-            lines.append(f"EMA15: {d['ema50_15']:.6f} / {d['ema200_15']:.6f}  | EMA1h: {d['ema50_1h']:.6f} / {d['ema200_1h']:.6f}")
-            lines.append(f"RSI15: {d['rsi_15']:.1f}  Vol15: {int(d['curr_vol_15']):,} (avg20 {int(d['avg_vol_15_20']):,})")
-            lines.append(f"BuyWall: {d['buy_wall']}  Time: {d['time_utc']}")
+        lines = ["🔥 *MEXC 1H — EMA(10/20/30) + RSI >50 (Temiz)* 🔥", ""]
+        for d in hits:
+            stop_price = d["close"] * (1.0 - STOP_LOSS_PCT)
+            lines.append(f"*{d['symbol']}* | Close={d['close']:.6f} | Δ={d['change']*100:.2f}%")
+            lines.append(f"EMA10={d['ema_fast']:.6f} EMA20={d['ema_mid']:.6f} EMA30={d['ema_slow']:.6f}")
+            lines.append(f"RSI={d['rsi']:.2f} (prev {d['rsi_prev']:.2f})")
+            lines.append(f"Önerilen stop-loss: {stop_price:.6f}  (≈ {STOP_LOSS_PCT*100:.1f}% altında)")
+            if d['rsi'] >= 65:
+                lines.append("⚠️ RSI yaklaşmakta: overbought uyarısı (RSI ≥ 65)")
             lines.append("---")
-        text = "\n".join(lines)
+        message = "\n".join(lines)
     else:
-        text = "📭 Binance USDT scan: no matches at this run."
+        message = "📭 MEXC 1H scan: kriterlere uyan coin yok."
 
-    send_telegram(text)
+    send_telegram(message)
+    # also save CSV for artifact (if desired)
+    try:
+        import csv
+        with open(CSV_OUT, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["symbol","close","change","ema10","ema20","ema30","rsi","time"])
+            for d in hits:
+                w.writerow([d["symbol"], d["close"], d["change"], d["ema_fast"], d["ema_mid"], d["ema_slow"], d["rsi"], d["time_utc"]])
+    except Exception:
+        pass
 
-# allow running from CLI or as scheduled job
 if __name__ == "__main__":
+    logger.info("Starting single-run MEXC scanner")
     run_once()
